@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isHallucination } from "@/lib/merge";
 
 export const runtime = "nodejs";
 
@@ -17,6 +18,11 @@ export async function POST(req: Request) {
   upstream.append("response_format", "json");
   upstream.append("temperature", "0"); // less hallucination on near-silent chunks
 
+  // Prime Whisper with the transcript so far: it carries the lecture's jargon
+  // and spelling into a chunk that would otherwise be transcribed cold.
+  const context = form.get("context");
+  if (typeof context === "string" && context.trim()) upstream.append("prompt", context.slice(-400));
+
   const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
     method: "POST",
     headers: { Authorization: `Bearer ${key}` },
@@ -28,5 +34,6 @@ export async function POST(req: Request) {
   }
 
   const data = await res.json();
-  return NextResponse.json({ text: (data.text ?? "").trim() });
+  const text = (data.text ?? "").trim();
+  return NextResponse.json({ text: isHallucination(text) ? "" : text });
 }

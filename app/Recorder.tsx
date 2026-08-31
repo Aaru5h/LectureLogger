@@ -6,6 +6,11 @@ import { appendChunk } from "@/lib/merge";
 const CHUNK_MS = 8000;
 const STRIDE_MS = 7000; // 1s of overlap between consecutive chunks
 
+// ponytail: fixed RMS gate, tune with the level meter in the header. A real room
+// has a real noise floor — swap for an adaptive floor (rolling percentile) if
+// lecture halls with loud HVAC start eating quiet speech.
+const SILENCE_RMS = 0.012;
+
 function pickMime() {
   const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
   return candidates.find((m) => MediaRecorder.isTypeSupported(m)) ?? "";
@@ -19,10 +24,18 @@ export default function Recorder() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
 
+  const [level, setLevel] = useState(0);
+
   const streamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recordersRef = useRef<Set<MediaRecorder>>(new Set());
   const transcriptBox = useRef<HTMLTextAreaElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const meterRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const peakListeners = useRef<Set<(rms: number) => void>>(new Set());
+  // Whisper transcribes each chunk cold; the tail of the transcript primes it
+  // with the lecture's vocabulary so terms stay spelled consistently.
+  const contextRef = useRef("");
 
   // Chunks finish out of order; hold later ones until their turn.
   const nextSeq = useRef(0);
@@ -36,28 +49,44 @@ export default function Recorder() {
       ready = buffered.current.get(doneSeq.current)!;
       buffered.current.delete(doneSeq.current);
       doneSeq.current++;
-      if (ready) setTranscript((t) => appendChunk(t, ready));
+      if (ready)
+        setTranscript((t) => {
+          const next = appendChunk(t, ready);
+          contextRef.current = next.slice(-400);
+          return next;
+        });
     }
   };
 
   const recordWindow = (stream: MediaStream, mime: string) => {
     const seq = nextSeq.current++;
-    const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+    const rec = new MediaRecorder(stream, {
+      ...(mime ? { mimeType: mime } : {}),
+      audioBitsPerSecond: 32000, // opus speech quality; ~4x smaller uploads than default
+    });
     const parts: Blob[] = [];
     recordersRef.current.add(rec);
+
+    let peak = 0;
+    const onLevel = (rms: number) => (peak = Math.max(peak, rms));
+    peakListeners.current.add(onLevel);
 
     rec.ondataavailable = (e) => e.data.size && parts.push(e.data);
     rec.onstop = async () => {
       recordersRef.current.delete(rec);
+      peakListeners.current.delete(onLevel);
       const type = rec.mimeType || "audio/webm";
       const ext = type.includes("mp4") ? "m4a" : "webm";
       const blob = new Blob(parts, { type });
-      if (blob.size < 2000) return commit(seq, "");
+      // Nothing was said in this window — skip the round trip and the
+      // hallucinated "Thank you." that Whisper returns for silence.
+      if (blob.size < 2000 || peak < SILENCE_RMS) return commit(seq, "");
 
       setPending((n) => n + 1);
       try {
         const form = new FormData();
         form.append("audio", new File([blob], `chunk-${seq}.${ext}`, { type }));
+        if (contextRef.current) form.append("context", contextRef.current);
         const res = await fetch("/api/transcribe", { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? "Transcription failed");
@@ -74,14 +103,43 @@ export default function Recorder() {
     setTimeout(() => rec.state !== "inactive" && rec.stop(), CHUNK_MS);
   };
 
+  const startMeter = (stream: MediaStream) => {
+    const ctx = new AudioContext();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    ctx.createMediaStreamSource(stream).connect(analyser);
+    audioCtxRef.current = ctx;
+
+    const buf = new Float32Array(analyser.fftSize);
+    meterRef.current = setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (const v of buf) sum += v * v;
+      const rms = Math.sqrt(sum / buf.length);
+      peakListeners.current.forEach((fn) => fn(rms));
+      setLevel(rms);
+    }, 100);
+  };
+
   const start = async () => {
     setError("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Browser-native WebRTC audio processing: kills steady background noise,
+      // room echo, and level swings before a single byte is uploaded.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          channelCount: 1,
+        },
+      });
       const mime = pickMime();
       streamRef.current = stream;
       nextSeq.current = doneSeq.current = 0;
       buffered.current.clear();
+      contextRef.current = transcript.slice(-400);
+      startMeter(stream);
       setRecording(true);
       recordWindow(stream, mime);
       timerRef.current = setInterval(() => recordWindow(stream, mime), STRIDE_MS);
@@ -96,6 +154,11 @@ export default function Recorder() {
     recordersRef.current.forEach((r) => r.state !== "inactive" && r.stop());
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    if (meterRef.current) clearInterval(meterRef.current);
+    meterRef.current = null;
+    audioCtxRef.current?.close();
+    audioCtxRef.current = null;
+    setLevel(0);
     setRecording(false);
   };
 
@@ -145,6 +208,12 @@ export default function Recorder() {
           <span className="flex items-center gap-2 text-sm text-red-400">
             <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-red-500" />
             Recording{pending > 0 ? ` · ${pending} chunk${pending > 1 ? "s" : ""} transcribing` : ""}
+            <span className="ml-1 h-2 w-24 overflow-hidden rounded-full bg-neutral-800" title="Input level — bars below the marker are treated as silence">
+              <span
+                className={`block h-full transition-[width] duration-100 ${level < SILENCE_RMS ? "bg-neutral-600" : "bg-emerald-500"}`}
+                style={{ width: `${Math.min(100, level * 400)}%` }}
+              />
+            </span>
           </span>
         ) : (
           pending > 0 && <span className="text-sm text-neutral-400">Finishing {pending}…</span>

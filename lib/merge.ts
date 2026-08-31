@@ -14,6 +14,24 @@ export function mergeOverlap(prev: string, next: string, maxWords = 12): string 
   return words.join(" ");
 }
 
+// Whisper invents these on near-silent or noise-only audio. Only drop a chunk
+// whose entire text is one of them, so a real "thank you" mid-sentence survives.
+const HALLUCINATIONS = [
+  "thank you",
+  "thanks for watching",
+  "thank you for watching",
+  "you",
+  "bye",
+  "okay",
+  "subtitles by the amara.org community",
+  "transcription by castingwords",
+];
+
+export function isHallucination(text: string): boolean {
+  const t = text.trim().toLowerCase().replace(/[.!?,\s]+$/g, "").replace(/\s+/g, " ");
+  return t === "" || HALLUCINATIONS.includes(t);
+}
+
 export function appendChunk(transcript: string, chunk: string): string {
   const tail = mergeOverlap(transcript, chunk);
   if (!tail) return transcript;

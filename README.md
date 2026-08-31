@@ -9,7 +9,9 @@ Record lectures, meetings, or discussions directly from your microphone, transcr
 ## ✨ Features
 
 - **🔴 Staggered Live Recording**: Uses dual interleaved `MediaRecorder` instances with overlapping time windows (8s window, 7s stride = 1s overlap) so speech across chunk boundaries is never cut off.
-- **⚡ Ultra-Fast Transcription**: Chunks are streamed to Groq's `whisper-large-v3` API endpoint with sub-second turnaround.
+- **🔇 Noise Rejection**: WebRTC noise suppression, echo cancellation and auto-gain on the mic stream, plus an RMS silence gate that skips uploading windows where nobody spoke — and a filter for the phrases Whisper hallucinates over silence ("Thank you.", "Thanks for watching").
+- **⚡ Ultra-Fast Transcription**: Chunks are streamed to Groq's `whisper-large-v3` API endpoint with sub-second turnaround, mono at 32 kbps (~4× smaller uploads) and primed with the running transcript so jargon stays spelled consistently.
+- **📚 Enriched Notes**: Beyond restructuring, the LLM adds missing definitions, formulas, worked examples and common misconceptions — each in a `> 📌 **Added context:**` blockquote so it's always distinguishable from what the lecturer actually said.
 - **🧩 Smart Client-Side Deduplication & Reordering**: Transcriptions arriving out of order are sequenced and merged using a word-level overlap algorithm (`lib/merge.ts`).
 - **📝 Chronological Note Generation**: Converts messy transcripts into polished Markdown notes that preserve the lecture's natural chronology, formatted with headers, definitions, and key takeaways.
 - **✏️ Dual Editable Panes**: Edit the live transcript or generated notes directly in real time.
@@ -125,7 +127,9 @@ flowchart TD
   ```ts
   const CHUNK_MS = 8000;  // Length of each audio chunk
   const STRIDE_MS = 7000; // Interval between consecutive chunk starts (1s overlap)
+  const SILENCE_RMS = 0.012; // Below this peak level, a chunk is never uploaded
   ```
+- **Silence Gate**: The live level meter beside the recording dot turns green once input crosses `SILENCE_RMS`. If quiet speech is being dropped, lower it; if room noise is being transcribed, raise it.
 - **Custom LLM Model**: Set `GROQ_NOTES_MODEL` in `.env.local` to switch between models available on your Groq catalog (e.g., `llama-3.3-70b-versatile`, `mixtral-8x7b-32768`, etc.).
 
 ---
