@@ -1,15 +1,16 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { appendChunk } from "@/lib/merge";
+import { appendChunk, splitSections } from "@/lib/merge";
 
 const CHUNK_MS = 8000;
 const STRIDE_MS = 7000; // 1s of overlap between consecutive chunks
 
-// ponytail: fixed RMS gate, tune with the level meter in the header. A real room
-// has a real noise floor — swap for an adaptive floor (rolling percentile) if
-// lecture halls with loud HVAC start eating quiet speech.
-const SILENCE_RMS = 0.012;
+// Every room has a different noise floor and every PA a different loudness, so
+// this is a starting point, not a constant — the slider in the header moves it.
+// Raise it in a noisy hall: the teacher on the PA is far louder than the people
+// around you, so a higher gate drops chunks that are only crosstalk.
+const DEFAULT_GATE = 0.012;
 
 function pickMime() {
   const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
@@ -22,9 +23,17 @@ export default function Recorder() {
   const [notes, setNotes] = useState("");
   const [pending, setPending] = useState(0);
   const [generating, setGenerating] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState("");
 
   const [level, setLevel] = useState(0);
+  const [gate, setGate] = useState(DEFAULT_GATE);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [deviceId, setDeviceId] = useState("");
+
+  // Read inside recorder callbacks without restarting the meter on every change.
+  const gateRef = useRef(gate);
+  gateRef.current = gate;
 
   const streamRef = useRef<MediaStream | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -80,7 +89,7 @@ export default function Recorder() {
       const blob = new Blob(parts, { type });
       // Nothing was said in this window — skip the round trip and the
       // hallucinated "Thank you." that Whisper returns for silence.
-      if (blob.size < 2000 || peak < SILENCE_RMS) return commit(seq, "");
+      if (blob.size < 2000 || peak < gateRef.current) return commit(seq, "");
 
       setPending((n) => n + 1);
       try {
@@ -132,8 +141,11 @@ export default function Recorder() {
           echoCancellation: true,
           autoGainControl: true,
           channelCount: 1,
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
         },
       });
+      // Labels are blank until mic permission is granted, so refresh the list here.
+      navigator.mediaDevices.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput")));
       const mime = pickMime();
       streamRef.current = stream;
       nextSeq.current = doneSeq.current = 0;
@@ -165,26 +177,46 @@ export default function Recorder() {
   useEffect(() => stop, []); // stop on unmount
 
   useEffect(() => {
+    navigator.mediaDevices?.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput")));
+  }, []);
+
+  useEffect(() => {
     const el = transcriptBox.current;
     if (el && document.activeElement !== el) el.scrollTop = el.scrollHeight;
   }, [transcript]);
 
+  // A 90-minute lecture is noted one section at a time, sequentially: it keeps
+  // peak token usage under Groq's per-minute limit and lets notes appear as
+  // they finish instead of after a single multi-minute request.
   const generate = async () => {
     setError("");
     setGenerating(true);
+    setNotes("");
+    const sections = splitSections(transcript);
+    setProgress({ done: 0, total: sections.length });
+
     try {
-      const res = await fetch("/api/notes", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ transcript }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Note generation failed");
-      setNotes(data.notes);
+      for (let i = 0; i < sections.length; i++) {
+        const res = await fetch("/api/notes", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transcript: sections[i],
+            index: i,
+            total: sections.length,
+            previousTail: i > 0 ? sections[i - 1].split(/\s+/).slice(-120).join(" ") : "",
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "Note generation failed");
+        setNotes((n) => (n ? `${n}\n\n${data.notes}` : data.notes));
+        setProgress({ done: i + 1, total: sections.length });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Note generation failed");
     } finally {
       setGenerating(false);
+      setProgress(null);
     }
   };
 
@@ -208,12 +240,6 @@ export default function Recorder() {
           <span className="flex items-center gap-2 text-sm text-red-400">
             <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-red-500" />
             Recording{pending > 0 ? ` · ${pending} chunk${pending > 1 ? "s" : ""} transcribing` : ""}
-            <span className="ml-1 h-2 w-24 overflow-hidden rounded-full bg-neutral-800" title="Input level — bars below the marker are treated as silence">
-              <span
-                className={`block h-full transition-[width] duration-100 ${level < SILENCE_RMS ? "bg-neutral-600" : "bg-emerald-500"}`}
-                style={{ width: `${Math.min(100, level * 400)}%` }}
-              />
-            </span>
           </span>
         ) : (
           pending > 0 && <span className="text-sm text-neutral-400">Finishing {pending}…</span>
@@ -223,12 +249,61 @@ export default function Recorder() {
           {recording ? "Stop Recording" : "Start Recording"}
         </button>
         <button onClick={generate} disabled={!transcript.trim() || generating} className={`${btn} bg-indigo-600 hover:bg-indigo-500`}>
-          {generating ? "Generating…" : "Generate Notes"}
+          {generating
+            ? progress && progress.total > 1
+              ? `Generating ${progress.done}/${progress.total}…`
+              : "Generating…"
+            : "Generate Notes"}
         </button>
         <button onClick={download} disabled={!notes.trim()} className={`${btn} border border-neutral-700 hover:bg-neutral-800`}>
           Download Notes
         </button>
       </header>
+
+      <div className="flex flex-wrap items-center gap-4 rounded-md border border-neutral-800 bg-neutral-900/50 px-3 py-2 text-xs text-neutral-400">
+        <label className="flex items-center gap-2">
+          Input
+          <select
+            value={deviceId}
+            onChange={(e) => setDeviceId(e.target.value)}
+            disabled={recording}
+            className="max-w-56 truncate rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200 disabled:opacity-50"
+          >
+            <option value="">System default</option>
+            {devices.map((d, i) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label || `Microphone ${i + 1}`}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <label className="flex grow items-center gap-2">
+          Noise gate
+          {/* Level meter with the gate drawn on it: anything left of the line is never uploaded. */}
+          <span className="relative h-2.5 w-40 shrink-0 overflow-hidden rounded-full bg-neutral-800">
+            <span
+              className={`block h-full transition-[width] duration-100 ${level < gate ? "bg-neutral-600" : "bg-emerald-500"}`}
+              style={{ width: `${Math.min(100, level * 400)}%` }}
+            />
+            <span className="absolute inset-y-0 w-px bg-amber-400" style={{ left: `${Math.min(100, gate * 400)}%` }} />
+          </span>
+          <input
+            type="range"
+            min={0}
+            max={0.05}
+            step={0.001}
+            value={gate}
+            onChange={(e) => setGate(Number(e.target.value))}
+            className="w-40 accent-amber-400"
+          />
+          <span className="tabular-nums">{gate.toFixed(3)}</span>
+        </label>
+
+        <span className="text-neutral-500">
+          Noisy room? Raise the gate until only the teacher&apos;s voice turns the bar green.
+        </span>
+      </div>
 
       {error && (
         <div className="flex items-start gap-3 rounded-md border border-amber-700/50 bg-amber-950/40 px-3 py-2 text-sm text-amber-200">

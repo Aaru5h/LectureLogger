@@ -32,6 +32,29 @@ export function isHallucination(text: string): boolean {
   return t === "" || HALLUCINATIONS.includes(t);
 }
 
+// A 90-minute lecture is ~13k words. Asking for notes on all of it in one call
+// makes the model skim the middle, so cut it into sections on sentence
+// boundaries and note each one separately, in order.
+export function splitSections(transcript: string, maxWords = 2200): string[] {
+  const sentences = transcript.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g) ?? [];
+  const sections: string[] = [];
+  let current: string[] = [];
+  let count = 0;
+
+  for (const s of sentences) {
+    const n = s.trim().split(/\s+/).length;
+    if (count + n > maxWords && current.length) {
+      sections.push(current.join(" ").trim());
+      current = [];
+      count = 0;
+    }
+    current.push(s.trim());
+    count += n;
+  }
+  if (current.length) sections.push(current.join(" ").trim());
+  return sections.length ? sections : [transcript.trim()];
+}
+
 export function appendChunk(transcript: string, chunk: string): string {
   const tail = mergeOverlap(transcript, chunk);
   if (!tail) return transcript;

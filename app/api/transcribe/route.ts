@@ -16,12 +16,18 @@ export async function POST(req: Request) {
   upstream.append("file", audio, (audio as File).name || "chunk.webm");
   upstream.append("model", "whisper-large-v3");
   upstream.append("response_format", "json");
+  // Pinning the language stops Whisper drifting into other languages on babble.
+  upstream.append("language", process.env.GROQ_TRANSCRIBE_LANGUAGE ?? "en");
   upstream.append("temperature", "0"); // less hallucination on near-silent chunks
 
   // Prime Whisper with the transcript so far: it carries the lecture's jargon
   // and spelling into a chunk that would otherwise be transcribed cold.
+  // Groq hard-caps the Whisper prompt at 896 chars; cut at a word boundary well
+  // under it so a long transcript tail can never fail the whole chunk.
   const context = form.get("context");
-  if (typeof context === "string" && context.trim()) upstream.append("prompt", context.slice(-400));
+  if (typeof context === "string" && context.trim()) {
+    upstream.append("prompt", context.slice(-880).replace(/^\S*\s/, "").trim());
+  }
 
   const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
     method: "POST",

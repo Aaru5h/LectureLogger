@@ -129,7 +129,8 @@ flowchart TD
   const STRIDE_MS = 7000; // Interval between consecutive chunk starts (1s overlap)
   const SILENCE_RMS = 0.012; // Below this peak level, a chunk is never uploaded
   ```
-- **Silence Gate**: The live level meter beside the recording dot turns green once input crosses `SILENCE_RMS`. If quiet speech is being dropped, lower it; if room noise is being transcribed, raise it.
+- **Noise Gate & Input Device**: Both live in the toolbar under the header. Pick the mic closest to the speaker, then raise the gate slider until only the teacher's voice turns the level bar green — chunks that stay below the amber marker are never uploaded, so nearby chatter never reaches Whisper.
+- **Long Lectures**: Transcripts over ~2,200 words are split on sentence boundaries and noted one section at a time, sequentially, with the button showing `Generating 3/6…`. Each section knows what preceded it, so a topic spanning a boundary continues as `## Topic (cont.)` and only the final section writes Key Takeaways. Groq's free tier allows 8,000 tokens/minute; the route absorbs `429`s by honouring the stated wait, so a 90-minute lecture takes a few minutes rather than failing.
 - **Custom LLM Model**: Set `GROQ_NOTES_MODEL` in `.env.local` to switch between models available on your Groq catalog (e.g., `llama-3.3-70b-versatile`, `mixtral-8x7b-32768`, etc.).
 
 ---
