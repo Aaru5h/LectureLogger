@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { appendChunk, splitSections } from "@/lib/merge";
+import { downloadNotesAsPdf } from "@/lib/pdf";
 
 const CHUNK_MS = 8000;
 const STRIDE_MS = 7000; // 1s of overlap between consecutive chunks
@@ -23,6 +24,7 @@ export default function Recorder() {
   const [notes, setNotes] = useState("");
   const [pending, setPending] = useState(0);
   const [generating, setGenerating] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState("");
 
@@ -220,7 +222,19 @@ export default function Recorder() {
     }
   };
 
-  const download = () => {
+  const downloadPdf = async () => {
+    if (!notes.trim() || exportingPdf) return;
+    setExportingPdf(true);
+    try {
+      await downloadNotesAsPdf(notes);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to generate PDF");
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
+  const downloadMd = () => {
     const url = URL.createObjectURL(new Blob([notes], { type: "text/markdown" }));
     const a = document.createElement("a");
     a.href = url;
@@ -255,8 +269,20 @@ export default function Recorder() {
               : "Generating…"
             : "Generate Notes"}
         </button>
-        <button onClick={download} disabled={!notes.trim()} className={`${btn} border border-neutral-700 hover:bg-neutral-800`}>
-          Download Notes
+        <button
+          onClick={downloadPdf}
+          disabled={!notes.trim() || exportingPdf}
+          className={`${btn} border border-neutral-700 hover:bg-neutral-800`}
+        >
+          {exportingPdf ? "Generating PDF…" : "Download PDF"}
+        </button>
+        <button
+          onClick={downloadMd}
+          disabled={!notes.trim()}
+          className={`${btn} text-neutral-400 border border-neutral-800 hover:bg-neutral-900 hover:text-neutral-200`}
+          title="Download raw Markdown (.md)"
+        >
+          .md
         </button>
       </header>
 

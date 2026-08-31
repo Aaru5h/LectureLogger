@@ -15,7 +15,7 @@ Record lectures, meetings, or discussions directly from your microphone, transcr
 - **🧩 Smart Client-Side Deduplication & Reordering**: Transcriptions arriving out of order are sequenced and merged using a word-level overlap algorithm (`lib/merge.ts`).
 - **📝 Chronological Note Generation**: Converts messy transcripts into polished Markdown notes that preserve the lecture's natural chronology, formatted with headers, definitions, and key takeaways.
 - **✏️ Dual Editable Panes**: Edit the live transcript or generated notes directly in real time.
-- **💾 One-Click Export**: Download structured lecture notes directly as a timestamped `.md` file client-side.
+- **💾 One-Click Export**: Download structured lecture notes directly as a styled `.pdf` document or raw `.md` file client-side.
 - **🔒 Privacy First & Stateless**: Audio and text live in browser memory; API keys never reach the client.
 
 ---
