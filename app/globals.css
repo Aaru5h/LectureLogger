@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0b0e14;
+  --color-panel: #131822;
+}
+
+html {
+  color-scheme: dark light;
+}
