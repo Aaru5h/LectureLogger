@@ -18,12 +18,125 @@ interface StyledLineItem {
   size: number;
   color: [number, number, number];
   width: number;
+  isCode?: boolean;
 }
 
 interface StyledLine {
   items: StyledLineItem[];
   width: number;
   height: number;
+}
+
+// Windows-1252 / WinAnsi characters in the 0x80 - 0x9F range supported by jsPDF standard fonts
+const WIN_ANSI_EXTRA = new Set([
+  "\u20AC", "\u201A", "\u0192", "\u201E", "\u2026", "\u2020", "\u2021", "\u02C6",
+  "\u2030", "\u0160", "\u2039", "\u0152", "\u017D", "\u2018", "\u2019", "\u201C",
+  "\u201D", "\u2022", "\u2013", "\u2014", "\u02DC", "\u2122", "\u0161", "\u203A",
+  "\u0153", "\u017E", "\u0178"
+]);
+
+function isWinAnsi(char: string): boolean {
+  const code = char.charCodeAt(0);
+  if (code >= 0x20 && code <= 0x7E) return true;
+  if (code >= 0xA0 && code <= 0xFF) return true;
+  if (code === 0x0A || code === 0x0D || code === 0x09) return true;
+  return WIN_ANSI_EXTRA.has(char);
+}
+
+/**
+ * Normalizes Unicode text to characters safely representable in PDF Type-1 fonts (WinAnsiEncoding).
+ * Prevents jsPDF from falling back to 2-byte UTF-16BE encoding which inserts NUL bytes between
+ * characters, causing letter-spacing stretching and severe text overlapping.
+ */
+export function cleanPdfText(text: string): string {
+  if (!text) return "";
+
+  const preFiltered = text
+    .normalize("NFC")
+    // Non-breaking hyphens, figure dashes, and math minus to standard hyphen
+    .replace(/[\u2010\u2011\u2012\u2212]/g, "-")
+    // Non-breaking spaces and narrow spaces to regular space
+    .replace(/[\u00A0\u202F\u2007\u2009\u200A]/g, " ")
+    // Zero-width spaces and joiners
+    .replace(/[\u200B\u200C\u200D\uFEFF]/g, "")
+    // Mathematical and logic arrows
+    .replace(/→/g, " -> ")
+    .replace(/←/g, " <- ")
+    .replace(/↔/g, " <-> ")
+    .replace(/⇒/g, " => ")
+    .replace(/⇐/g, " <= ")
+    .replace(/⇔/g, " <=> ")
+    // Mathematical operators
+    .replace(/≈/g, " ~ ")
+    .replace(/≠/g, " != ")
+    .replace(/≤/g, " <= ")
+    .replace(/≥/g, " >= ")
+    .replace(/±/g, " +/- ")
+    .replace(/×/g, "x")
+    .replace(/÷/g, "/")
+    .replace(/[⌈⌊]/g, "[")
+    .replace(/[⌉⌋]/g, "]")
+    // Subscripts & superscripts
+    .replace(/₀/g, "0").replace(/₁/g, "1").replace(/₂/g, "2").replace(/₃/g, "3").replace(/₄/g, "4")
+    .replace(/₅/g, "5").replace(/₆/g, "6").replace(/₇/g, "7").replace(/₈/g, "8").replace(/₉/g, "9")
+    .replace(/⁰/g, "^0").replace(/¹/g, "^1").replace(/²/g, "^2").replace(/³/g, "^3").replace(/⁴/g, "^4")
+    .replace(/⁵/g, "^5").replace(/⁶/g, "^6").replace(/⁷/g, "^7").replace(/⁸/g, "^8").replace(/⁹/g, "^9")
+    // Common Greek symbols in notes
+    .replace(/τ/g, "tau")
+    .replace(/Ω/g, "Ohm")
+    .replace(/μ/g, "mu")
+    .replace(/π/g, "pi")
+    .replace(/θ/g, "theta")
+    .replace(/Δ/g, "Delta")
+    .replace(/α/g, "alpha")
+    .replace(/β/g, "beta")
+    .replace(/λ/g, "lambda")
+    .replace(/σ/g, "sigma")
+    .replace(/ω/g, "omega")
+    // Box-drawing characters
+    .replace(/[─━]/g, "-")
+    .replace(/[│┃]/g, "|")
+    .replace(/[┌┐└┘├┤┼]/g, "+")
+    .replace(/►/g, ">")
+    .replace(/◯/g, "O")
+    // Strip emojis and symbols outside BMP
+    .replace(/[\u{1F300}-\u{1FAFF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{2600}-\u{27BF}]/gu, "");
+
+  let result = "";
+  for (const ch of preFiltered) {
+    if (isWinAnsi(ch)) {
+      result += ch;
+    } else {
+      // Non-supported character fallback
+      result += " ";
+    }
+  }
+
+  return result;
+}
+
+function pushWords(
+  words: StyledWord[],
+  text: string,
+  font: "helvetica" | "courier",
+  style: "normal" | "bold" | "italic" | "bolditalic",
+  size: number,
+  color: [number, number, number],
+  isCode = false
+) {
+  if (!text) return;
+  const parts = text.split(/(\s+)/);
+  for (const part of parts) {
+    if (!part) continue;
+    words.push({
+      text: part,
+      font,
+      style,
+      size,
+      color,
+      isCode,
+    });
+  }
 }
 
 function extractStyledWords(
@@ -36,53 +149,32 @@ function extractStyledWords(
   const words: StyledWord[] = [];
 
   for (const token of tokens) {
-    if (token.type === "text") {
-      const parts = token.text.split(/(\s+)/);
-      for (const part of parts) {
-        if (!part) continue;
-        words.push({
-          text: part,
-          font: "helvetica",
-          style: currentStyle,
-          size: baseSize,
-          color: baseColor,
-        });
+    // If token has nested inline tokens (e.g., strong, em, text with child formatting),
+    // we MUST recurse into token.tokens so inline Markdown is properly rendered instead
+    // of leaking raw syntax like **Latch** or ignoring nested styles.
+    if ("tokens" in token && Array.isArray(token.tokens) && token.tokens.length > 0) {
+      let nextStyle = currentStyle;
+      if (token.type === "strong") {
+        nextStyle = currentStyle === "italic" ? "bolditalic" : "bold";
+      } else if (token.type === "em") {
+        nextStyle = currentStyle === "bold" ? "bolditalic" : "italic";
       }
+      const color = token.type === "link" ? ([79, 70, 229] as [number, number, number]) : baseColor;
+      words.push(...extractStyledWords(token.tokens, baseSize, color, nextStyle));
     } else if (token.type === "strong") {
       const nextStyle = currentStyle === "italic" ? "bolditalic" : "bold";
-      words.push(...extractStyledWords(token.tokens, baseSize, baseColor, nextStyle));
+      pushWords(words, token.text || "", "helvetica", nextStyle, baseSize, baseColor);
     } else if (token.type === "em") {
       const nextStyle = currentStyle === "bold" ? "bolditalic" : "italic";
-      words.push(...extractStyledWords(token.tokens, baseSize, baseColor, nextStyle));
+      pushWords(words, token.text || "", "helvetica", nextStyle, baseSize, baseColor);
     } else if (token.type === "codespan") {
-      const parts = token.text.split(/(\s+)/);
-      for (const part of parts) {
-        if (!part) continue;
-        words.push({
-          text: part,
-          font: "courier",
-          style: "normal",
-          size: baseSize * 0.9,
-          color: [15, 23, 42],
-          isCode: true,
-        });
-      }
+      pushWords(words, token.text || "", "courier", "normal", baseSize * 0.9, [15, 23, 42], true);
     } else if (token.type === "link") {
-      words.push(...extractStyledWords(token.tokens, baseSize, [79, 70, 229], currentStyle));
-    } else if ("tokens" in token && Array.isArray(token.tokens)) {
-      words.push(...extractStyledWords(token.tokens, baseSize, baseColor, currentStyle));
+      pushWords(words, token.text || "", "helvetica", currentStyle, baseSize, [79, 70, 229]);
+    } else if (token.type === "del") {
+      pushWords(words, token.text || "", "helvetica", currentStyle, baseSize, baseColor);
     } else if ("text" in token && typeof token.text === "string") {
-      const parts = token.text.split(/(\s+)/);
-      for (const part of parts) {
-        if (!part) continue;
-        words.push({
-          text: part,
-          font: "helvetica",
-          style: currentStyle,
-          size: baseSize,
-          color: baseColor,
-        });
-      }
+      pushWords(words, token.text, "helvetica", currentStyle, baseSize, baseColor);
     }
   }
 
@@ -111,6 +203,11 @@ function wrapStyledWords(
       const subparts = word.text.split("\n");
       for (let s = 0; s < subparts.length; s++) {
         if (s > 0) {
+          // Remove trailing spaces before line break
+          if (currentItems.length > 0 && /^\s+$/.test(currentItems[currentItems.length - 1].text)) {
+            const last = currentItems.pop()!;
+            currentWidth -= last.width;
+          }
           lines.push({
             items: currentItems,
             width: currentWidth,
@@ -133,6 +230,7 @@ function wrapStyledWords(
 
     const w = measureWord(doc, word);
     if (/^\s+$/.test(word.text)) {
+      // Don't accumulate leading spaces on an empty line
       if (currentItems.length > 0) {
         currentItems.push({ ...word, width: w });
         currentWidth += w;
@@ -141,6 +239,11 @@ function wrapStyledWords(
     }
 
     if (currentWidth + w > maxWidth && currentItems.length > 0) {
+      // Trim trailing spaces before breaking to next line
+      if (/^\s+$/.test(currentItems[currentItems.length - 1].text)) {
+        const last = currentItems.pop()!;
+        currentWidth -= last.width;
+      }
       lines.push({
         items: currentItems,
         width: currentWidth,
@@ -157,6 +260,10 @@ function wrapStyledWords(
   }
 
   if (currentItems.length > 0) {
+    if (/^\s+$/.test(currentItems[currentItems.length - 1].text)) {
+      const last = currentItems.pop()!;
+      currentWidth -= last.width;
+    }
     lines.push({
       items: currentItems,
       width: currentWidth,
@@ -185,6 +292,11 @@ function renderStyledLines(
 
     let x = startX;
     for (const item of line.items) {
+      if (item.isCode) {
+        // Pill background for inline codespan
+        doc.setFillColor(241, 245, 249); // slate-100
+        doc.roundedRect(x - 1, y + 1.5, item.width + 2, line.height - 3, 1.5, 1.5, "F");
+      }
       doc.setFont(item.font, item.style);
       doc.setFontSize(item.size);
       doc.setTextColor(item.color[0], item.color[1], item.color[2]);
@@ -241,7 +353,9 @@ export function generateNotesPdfDoc(markdownNotes: string): jsPDF {
   doc.line(leftMargin, y, leftMargin + contentWidth, y);
   y += 18;
 
-  const tokens = marked.lexer(markdownNotes);
+  // Clean Markdown input to sanitize Unicode symbols and prevent jsPDF 16-bit encoding overlaps
+  const sanitizedMarkdown = cleanPdfText(markdownNotes);
+  const tokens = marked.lexer(sanitizedMarkdown);
 
   for (const token of tokens) {
     if (token.type === "space") {
@@ -291,7 +405,7 @@ export function generateNotesPdfDoc(markdownNotes: string): jsPDF {
         const bulletWidth = Math.max(doc.getTextWidth(bulletText), 14);
         const itemContentWidth = contentWidth - bulletWidth - 4;
 
-        // Render bullet prefix
+        // Render bullet prefix & text
         const itemWords = extractStyledWords(item.tokens, 10, [30, 41, 59], "normal");
         const lines = wrapStyledWords(doc, itemWords, itemContentWidth, 1.45);
 
@@ -316,6 +430,15 @@ export function generateNotesPdfDoc(markdownNotes: string): jsPDF {
       if (token.tokens) {
         for (const sub of token.tokens as any[]) {
           if (sub.type === "paragraph") {
+            if (quoteWords.length > 0) {
+              quoteWords.push({
+                text: "\n\n",
+                font: "helvetica",
+                style: "normal",
+                size: 9.5,
+                color: [51, 65, 85],
+              });
+            }
             quoteWords.push(...extractStyledWords(sub.tokens, 9.5, [51, 65, 85], "normal"));
           } else if (sub.type === "text") {
             quoteWords.push(...extractStyledWords(sub.tokens || [sub], 9.5, [51, 65, 85], "normal"));
