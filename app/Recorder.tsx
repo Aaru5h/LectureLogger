@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { appendChunk, splitSections } from "@/lib/merge";
 import { downloadNotesAsPdf } from "@/lib/pdf";
+import Icon from "./Icon";
 
 const CHUNK_MS = 8000;
 const STRIDE_MS = 7000; // 1s of overlap between consecutive chunks
@@ -20,6 +21,8 @@ function pickMime() {
 
 export default function Recorder() {
   const [recording, setRecording] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const [transcript, setTranscript] = useState("");
   const [notes, setNotes] = useState("");
   const [pending, setPending] = useState(0);
@@ -133,6 +136,8 @@ export default function Recorder() {
   };
 
   const start = async () => {
+    if (starting || pending > 0) return;
+    setStarting(true);
     setError("");
     try {
       // Browser-native WebRTC audio processing: kills steady background noise,
@@ -147,7 +152,7 @@ export default function Recorder() {
         },
       });
       // Labels are blank until mic permission is granted, so refresh the list here.
-      navigator.mediaDevices.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput")));
+      navigator.mediaDevices.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput"))).catch(() => {});
       const mime = pickMime();
       streamRef.current = stream;
       nextSeq.current = doneSeq.current = 0;
@@ -158,7 +163,10 @@ export default function Recorder() {
       recordWindow(stream, mime);
       timerRef.current = setInterval(() => recordWindow(stream, mime), STRIDE_MS);
     } catch {
-      setError("Microphone access was denied or unavailable.");
+      stop();
+      setError("Microphone unavailable. Allow microphone access in your browser settings, then try again. You can also paste a transcript below.");
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -179,7 +187,17 @@ export default function Recorder() {
   useEffect(() => stop, []); // stop on unmount
 
   useEffect(() => {
-    navigator.mediaDevices?.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput")));
+    if (!recording) return;
+    const startedAt = Date.now();
+    const previous = elapsed;
+    const timer = setInterval(() => setElapsed(previous + Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+    // Capture the elapsed duration only when recording resumes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recording]);
+
+  useEffect(() => {
+    navigator.mediaDevices?.enumerateDevices().then((d) => setDevices(d.filter((x) => x.kind === "audioinput"))).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -243,125 +261,101 @@ export default function Recorder() {
     URL.revokeObjectURL(url);
   };
 
-  const btn = "rounded-md px-4 py-2 text-sm font-medium disabled:opacity-40 disabled:cursor-not-allowed";
+  const wordCount = (text: string) => text.trim() ? text.trim().split(/\s+/).length : 0;
+  const duration = `${Math.floor(elapsed / 60).toString().padStart(2, "0")}:${(elapsed % 60).toString().padStart(2, "0")}`;
+  const busy = recording || starting || pending > 0;
+  const status = recording ? "Recording" : starting ? "Connecting microphone" : pending > 0 ? "Finishing transcript" : "Ready to record";
 
   return (
-    <main className="mx-auto flex h-screen max-w-6xl flex-col gap-4 p-6">
-      <header className="flex flex-wrap items-center gap-3">
-        <h1 className="mr-auto text-lg font-semibold">LectureLogger</h1>
-
-        {recording ? (
-          <span className="flex items-center gap-2 text-sm text-red-400">
-            <span className="h-2.5 w-2.5 animate-pulse rounded-full bg-red-500" />
-            Recording{pending > 0 ? ` · ${pending} chunk${pending > 1 ? "s" : ""} transcribing` : ""}
-          </span>
-        ) : (
-          pending > 0 && <span className="text-sm text-neutral-400">Finishing {pending}…</span>
-        )}
-
-        <button onClick={recording ? stop : start} className={`${btn} ${recording ? "bg-red-600 hover:bg-red-500" : "bg-emerald-600 hover:bg-emerald-500"}`}>
-          {recording ? "Stop Recording" : "Start Recording"}
-        </button>
-        <button onClick={generate} disabled={!transcript.trim() || generating} className={`${btn} bg-indigo-600 hover:bg-indigo-500`}>
-          {generating
-            ? progress && progress.total > 1
-              ? `Generating ${progress.done}/${progress.total}…`
-              : "Generating…"
-            : "Generate Notes"}
-        </button>
-        <button
-          onClick={downloadPdf}
-          disabled={!notes.trim() || exportingPdf}
-          className={`${btn} border border-neutral-700 hover:bg-neutral-800`}
-        >
-          {exportingPdf ? "Generating PDF…" : "Download PDF"}
-        </button>
-        <button
-          onClick={downloadMd}
-          disabled={!notes.trim()}
-          className={`${btn} text-neutral-400 border border-neutral-800 hover:bg-neutral-900 hover:text-neutral-200`}
-          title="Download raw Markdown (.md)"
-        >
-          .md
-        </button>
+    <main className="workspace">
+      <header className="app-header">
+        <a className="brand" href="/" aria-label="LectureLogger home">
+          <span className="brand-mark"><Icon name="mic" /></span>
+          <span>Lecture<span className="brand-light">Logger</span></span>
+        </a>
+        <span className="header-description">A little more focus. A lot less note-taking.</span>
+        <span className="workspace-label"><span className="status-dot" /> Lecture workspace</span>
       </header>
 
-      <div className="flex flex-wrap items-center gap-4 rounded-md border border-neutral-800 bg-neutral-900/50 px-3 py-2 text-xs text-neutral-400">
-        <label className="flex items-center gap-2">
-          Input
-          <select
-            value={deviceId}
-            onChange={(e) => setDeviceId(e.target.value)}
-            disabled={recording}
-            className="max-w-56 truncate rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-200 disabled:opacity-50"
-          >
-            <option value="">System default</option>
-            {devices.map((d, i) => (
-              <option key={d.deviceId} value={d.deviceId}>
-                {d.label || `Microphone ${i + 1}`}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="flex grow items-center gap-2">
-          Noise gate
-          {/* Level meter with the gate drawn on it: anything left of the line is never uploaded. */}
-          <span className="relative h-2.5 w-40 shrink-0 overflow-hidden rounded-full bg-neutral-800">
-            <span
-              className={`block h-full transition-[width] duration-100 ${level < gate ? "bg-neutral-600" : "bg-emerald-500"}`}
-              style={{ width: `${Math.min(100, level * 400)}%` }}
-            />
-            <span className="absolute inset-y-0 w-px bg-amber-400" style={{ left: `${Math.min(100, gate * 400)}%` }} />
-          </span>
-          <input
-            type="range"
-            min={0}
-            max={0.05}
-            step={0.001}
-            value={gate}
-            onChange={(e) => setGate(Number(e.target.value))}
-            className="w-40 accent-amber-400"
-          />
-          <span className="tabular-nums">{gate.toFixed(3)}</span>
-        </label>
-
-        <span className="text-neutral-500">
-          Noisy room? Raise the gate until only the teacher&apos;s voice turns the bar green.
-        </span>
-      </div>
-
-      {error && (
-        <div className="flex items-start gap-3 rounded-md border border-amber-700/50 bg-amber-950/40 px-3 py-2 text-sm text-amber-200">
-          <span className="grow">{error}</span>
-          <button onClick={() => setError("")} className="text-amber-400 hover:text-amber-200">
-            dismiss
-          </button>
+      <section className="intro" aria-labelledby="workspace-title">
+        <div>
+          <h1 id="workspace-title">Stay in the lecture.</h1>
+          <p>Capture the conversation. Turn it into notes you can come back to.</p>
         </div>
-      )}
+        <div className="workflow" aria-label="Workflow: Record, transcribe, generate notes">
+          <span className={recording ? "current-step" : ""}>Record</span><Icon name="chevron" />
+          <span className={transcript && !notes ? "current-step" : ""}>Transcribe</span><Icon name="chevron" />
+          <span className={notes ? "current-step" : ""}>Make it yours</span>
+        </div>
+      </section>
 
-      <div className="grid min-h-0 grow gap-4 md:grid-cols-2">
-        <section className="flex min-h-0 flex-col gap-2">
-          <h2 className="text-sm uppercase tracking-wide text-neutral-400">Transcript</h2>
-          <textarea
-            ref={transcriptBox}
-            value={transcript}
-            onChange={(e) => setTranscript(e.target.value)}
-            placeholder="Start recording and the live transcript appears here. You can edit it at any time."
-            className="min-h-64 grow resize-none rounded-lg border border-neutral-800 bg-neutral-900 p-4 font-mono text-sm leading-relaxed outline-none focus:border-neutral-600"
-          />
+      <section className={`recording-panel ${recording ? "is-recording" : ""}`} aria-label="Recording controls">
+        <div className="recording-main">
+          <div className="recording-info">
+            <div className="recording-status" role="status"><span className={`status-dot ${recording ? "live-dot" : ""}`} />{status}</div>
+            <div className="session-time"><span>{duration}</span><span className="session-caption">{recording ? "Listening to your lecture" : elapsed > 0 ? "Recorded this session" : "Your next idea starts here"}</span></div>
+          </div>
+          <div className="recording-actions">
+            <div className="input-visual" aria-hidden="true">
+              {Array.from({ length: 25 }, (_, i) => <span key={i} style={{ height: recording ? `${Math.max(4, Math.min(34, level * 500 * (0.45 + Math.abs(Math.sin(i * 1.7))))) }px` : "4px" }} />)}
+            </div>
+            <button onClick={recording ? stop : start} disabled={!recording && (starting || pending > 0)} className={`button record-button ${recording ? "stop-button" : ""}`}>
+              <Icon name={recording ? "stop" : "mic"} />
+              {recording ? "Stop recording" : starting ? "Connecting…" : pending > 0 ? "Finishing…" : elapsed > 0 ? "Resume recording" : "Start recording"}
+            </button>
+          </div>
+        </div>
+        <details className="audio-settings">
+          <summary><Icon name="settings" /><span>Audio settings</span><span className="settings-summary">Microphone & noise gate</span><Icon name="chevron" className="settings-chevron" /></summary>
+          <div className="settings-content">
+            <label className="input-setting" htmlFor="microphone">Microphone
+              <select id="microphone" value={deviceId} onChange={(e) => setDeviceId(e.target.value)} disabled={recording || starting}>
+                <option value="">System default</option>
+                {devices.filter((d) => d.deviceId).map((d, i) => <option key={d.deviceId} value={d.deviceId}>{d.label || `Microphone ${i + 1}`}</option>)}
+              </select>
+            </label>
+            <div className="gate-setting">
+              <label htmlFor="noise-gate">Noise gate <output htmlFor="noise-gate">{gate.toFixed(3)}</output></label>
+              <input id="noise-gate" type="range" min={0} max={0.05} step={0.001} value={gate} onChange={(e) => setGate(Number(e.target.value))} aria-describedby="gate-help" />
+            </div>
+            <div className="meter-setting"><span>Input level</span>
+              <div className="level-meter" role="meter" aria-label="Microphone input level" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(Math.min(100, level * 400))}>
+                <span className={level < gate ? "below-gate" : "above-gate"} style={{ width: `${Math.min(100, level * 400)}%` }} />
+                <i style={{ left: `${Math.min(100, gate * 400)}%` }} />
+              </div>
+            </div>
+            <p id="gate-help">Noisy room? Raise the gate until only the teacher’s voice turns the input bar green.</p>
+          </div>
+        </details>
+      </section>
+
+      {error && <div className="error-banner" role="alert"><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><Icon name="close" /></button></div>}
+
+      <div className="editor-grid">
+        <section className="editor-panel" aria-labelledby="transcript-heading">
+          <div className="editor-header"><div className="editor-title"><Icon name="mic" /><h2 id="transcript-heading">Live transcript</h2></div><span className={`editor-badge ${recording ? "live-badge" : ""}`}>{recording ? "Live" : "Editable"}</span></div>
+          <div className="editor-body">
+            {!transcript && <div className="empty-state" aria-hidden="true"><div className="empty-symbol transcript-symbol"><Icon name="mic" /></div><h3>Let the lecture unfold.</h3><p>Start recording and your words will appear here.<br />Already have a transcript? Paste it below.</p><span className="empty-hint">Click anywhere to start typing</span></div>}
+            <textarea id="transcript" aria-label="Live transcript" ref={transcriptBox} value={transcript} onChange={(e) => setTranscript(e.target.value)} spellCheck className="editor-textarea" />
+          </div>
+          <footer className="editor-footer"><span>{wordCount(transcript).toLocaleString()} words</span><span role="status">{pending > 0 ? `Transcribing ${pending} audio ${pending === 1 ? "segment" : "segments"}…` : "Edit your transcript at any time"}</span></footer>
         </section>
 
-        <section className="flex min-h-0 flex-col gap-2">
-          <h2 className="text-sm uppercase tracking-wide text-neutral-400">Notes</h2>
-          <textarea
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-            placeholder="Generated notes appear here as Markdown."
-            className="min-h-64 grow resize-none rounded-lg border border-neutral-800 bg-neutral-900 p-4 font-mono text-sm leading-relaxed outline-none focus:border-neutral-600"
-          />
+        <section className="editor-panel notes-panel" aria-labelledby="notes-heading" aria-busy={generating}>
+          <div className="editor-header"><div className="editor-title"><Icon name="notes" /><h2 id="notes-heading">Lecture notes</h2></div>
+            <button onClick={generate} disabled={!transcript.trim() || generating || busy} className="button generate-button" title={busy ? "Finish recording and transcription before generating notes" : undefined}>
+              {generating ? <span className="spinner" /> : <Icon name="arrow" />}<span>{generating ? "Generating…" : "Generate notes"}</span>
+            </button>
+          </div>
+          <div className="editor-body">
+            {!notes && <div className="empty-state" aria-hidden="true"><div className="empty-symbol notes-symbol"><Icon name="notes" /></div><h3>{generating ? "Making sense of your lecture…" : "From spoken to structured."}</h3><p>{generating ? "Your notes will appear here as each section is ready." : "Turn your transcript into organized notes, ready to review, edit, and take with you."}</p>{!generating && <span className="empty-hint">Add a transcript, then generate your notes</span>}</div>}
+            <textarea aria-label="Lecture notes in Markdown" value={notes} onChange={(e) => setNotes(e.target.value)} readOnly={generating} className="editor-textarea notes-textarea" spellCheck />
+          </div>
+          {generating && <div className="generation-progress" role="status"><span>{progress ? `Writing section ${Math.min(progress.done + 1, progress.total)} of ${progress.total}` : "Preparing notes…"}</span><progress value={progress?.done ?? 0} max={progress?.total || 1} /></div>}
+          <footer className="editor-footer notes-footer"><span>Markdown · {wordCount(notes).toLocaleString()} words</span><div className="export-actions"><button onClick={downloadMd} disabled={!notes.trim() || generating} className="export-button" aria-label="Download notes as Markdown">.md</button><button onClick={downloadPdf} disabled={!notes.trim() || exportingPdf || generating} className="export-button"><Icon name="download" />{exportingPdf ? "Exporting…" : "Export PDF"}</button></div></footer>
         </section>
       </div>
+      <footer className="workspace-footer"><span>Space to listen. Room to think.</span><span>Notes stay in this session. Export before you leave.</span></footer>
     </main>
   );
 }
